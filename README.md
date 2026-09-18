@@ -53,7 +53,7 @@ That means a long answer can pass when the task actually requires detail. The ex
 
 Jev also returns separate probabilities for repetition, filler, and over-explanation. Those signals are included in the hidden revision feedback so Pi knows what to remove.
 
-## TUI behavior
+## TUI behavior and logs
 
 `pi-jev-concise` does **not** buffer or replace Pi's TUI. You may see:
 
@@ -63,6 +63,20 @@ Jev also returns separate probabilities for repetition, filler, and over-explana
 
 The technical Jev feedback uses a Pi custom message with `display: false`, so it participates in model context without adding noise to the transcript.
 
+Intervention logs are enabled by default. When Jev rejects an answer, Pi shows a TUI notification like:
+
+```text
+pi-jev-concise: intervention 1/3 · revise 0.91 >= 0.72 · repetition 0.80 · filler 0.67 · over-explanation 0.31 · 184 ms
+```
+
+When a rewritten answer passes:
+
+```text
+pi-jev-concise: revision passed · revise 0.24 < 0.72 · 151 ms
+```
+
+So you can tell exactly when the extension intervened without making the hidden revision prompt visible.
+
 ## Configuration
 
 All configuration is optional.
@@ -71,6 +85,7 @@ All configuration is optional.
 | --- | ---: | --- |
 | `TYPESAFE_API_KEY` | required | TypeSafe/Jev API key |
 | `PI_JEV_CONCISE_ENABLED` | `true` | Set to `false` to start disabled |
+| `PI_JEV_CONCISE_LOGS` | `true` | Set to `false` to hide intervention/pass notifications |
 | `PI_JEV_CONCISE_THRESHOLD` | `0.72` | Reject when `P(needs revision)` is at least this value |
 | `PI_JEV_CONCISE_MAX_RETRIES` | `3` | Maximum automatic rewrites for one user turn |
 | `PI_JEV_CONCISE_MAX_REQUESTS` | `1000` | Maximum Jev requests for this extension instance |
@@ -82,6 +97,8 @@ Inside Pi:
 /concise on
 /concise off
 ```
+
+`/concise status` also reports whether intervention logs are enabled.
 
 The `on`/`off` setting is session-local. Use the environment variable for a persistent startup default.
 
