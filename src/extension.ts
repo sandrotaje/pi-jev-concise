@@ -2,6 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createTypeSafe } from "pi-typesafe";
 import {
   evaluateConcision,
+  formatScore,
   normalizeThreshold,
   revisionFeedback,
 } from "./concise.js";
@@ -12,6 +13,7 @@ const DEFAULT_MAX_REQUESTS = 1_000;
 
 interface RuntimeConfig {
   enabled: boolean;
+  logs: boolean;
   threshold: number;
   maxRetries: number;
   maxRequests: number;
@@ -24,13 +26,22 @@ function envNumber(name: string): number | undefined {
   return Number.isFinite(value) ? value : undefined;
 }
 
+function envBoolean(name: string, fallback: boolean): boolean {
+  const raw = process.env[name]?.trim().toLowerCase();
+  if (!raw) return fallback;
+  if (["1", "true", "yes", "on"].includes(raw)) return true;
+  if (["0", "false", "no", "off"].includes(raw)) return false;
+  return fallback;
+}
+
 function positiveInteger(value: number | undefined, fallback: number): number {
   return value !== undefined && Number.isSafeInteger(value) && value > 0 ? value : fallback;
 }
 
 export function loadConfig(): RuntimeConfig {
   return {
-    enabled: process.env.PI_JEV_CONCISE_ENABLED?.trim().toLowerCase() !== "false",
+    enabled: envBoolean("PI_JEV_CONCISE_ENABLED", true),
+    logs: envBoolean("PI_JEV_CONCISE_LOGS", true),
     threshold: normalizeThreshold(envNumber("PI_JEV_CONCISE_THRESHOLD")),
     maxRetries: positiveInteger(envNumber("PI_JEV_CONCISE_MAX_RETRIES"), DEFAULT_MAX_RETRIES),
     maxRequests: positiveInteger(envNumber("PI_JEV_CONCISE_MAX_REQUESTS"), DEFAULT_MAX_REQUESTS),
@@ -66,6 +77,27 @@ export function latestRoleText(messages: readonly unknown[], role: "user" | "ass
   return latestRoleMessage(messages, role)?.text;
 }
 
+export function interventionLog(
+  scores: { needsRevision: number; repetition: number; filler: number; overExplanation: number },
+  retry: number,
+  maxRetries: number,
+  threshold: number,
+  elapsedMs: number,
+): string {
+  return [
+    `${PACKAGE_NAME}: intervention ${retry}/${maxRetries}`,
+    `revise ${formatScore(scores.needsRevision)} >= ${formatScore(threshold)}`,
+    `repetition ${formatScore(scores.repetition)}`,
+    `filler ${formatScore(scores.filler)}`,
+    `over-explanation ${formatScore(scores.overExplanation)}`,
+    `${elapsedMs} ms`,
+  ].join(" · ");
+}
+
+export function passLog(needsRevision: number, threshold: number, elapsedMs: number): string {
+  return `${PACKAGE_NAME}: revision passed · revise ${formatScore(needsRevision)} < ${formatScore(threshold)} · ${elapsedMs} ms`;
+}
+
 export default function conciseExtension(pi: ExtensionAPI): void {
   const config = loadConfig();
   let enabled = config.enabled;
@@ -93,7 +125,7 @@ export default function conciseExtension(pi: ExtensionAPI): void {
 
       if (ctx.hasUI) {
         ctx.ui.notify(
-          `${PACKAGE_NAME}: ${enabled ? "on" : "off"}; threshold ${config.threshold.toFixed(2)}; max retries ${config.maxRetries}.`,
+          `${PACKAGE_NAME}: ${enabled ? "on" : "off"}; threshold ${config.threshold.toFixed(2)}; max retries ${config.maxRetries}; logs ${config.logs ? "on" : "off"}.`,
           "info",
         );
       }
@@ -146,6 +178,9 @@ export default function conciseExtension(pi: ExtensionAPI): void {
 
     warned = false;
     if (verdict.pass) {
+      if (revising && config.logs && ctx.hasUI) {
+        ctx.ui.notify(passLog(verdict.scores.needsRevision, config.threshold, verdict.elapsedMs), "info");
+      }
       revising = false;
       retries = 0;
       return;
@@ -160,6 +195,13 @@ export default function conciseExtension(pi: ExtensionAPI): void {
 
     retries += 1;
     revising = true;
+
+    if (config.logs && ctx.hasUI) {
+      ctx.ui.notify(
+        interventionLog(verdict.scores, retries, config.maxRetries, config.threshold, verdict.elapsedMs),
+        "warning",
+      );
+    }
 
     pi.sendMessage(
       {
