@@ -1,0 +1,72 @@
+{
+  "name": "pi-jev-concise",
+  "version": "0.1.0",
+  "description": "A Pi extension that uses Jev to detect unnecessarily verbose answers and automatically request a more concise revision.",
+  "type": "module",
+  "license": "MIT",
+  "author": "sandrotaje",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sandrotaje/pi-jev-concise.git"
+  },
+  "homepage": "https://github.com/sandrotaje/pi-jev-concise#readme",
+  "bugs": "https://github.com/sandrotaje/pi-jev-concise/issues",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "jev",
+    "typesafe",
+    "concise",
+    "llm",
+    "quality-gate"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./extension": {
+      "types": "./dist/extension.d.ts",
+      "import": "./dist/extension.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/extension.ts"
+    ]
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "check": "npm run typecheck && npm test && npm run build",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "pi-typesafe": "^0.5.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.23.13",
+    "typescript": "^6.0.0"
+  }
+}
