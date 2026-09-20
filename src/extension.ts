@@ -1,4 +1,7 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createHash } from "node:crypto";
+import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, MarkdownTransformContext } from "@earendil-works/pi-coding-agent";
+import { Markdown } from "@earendil-works/pi-tui";
 import { createTypeSafe } from "pi-typesafe";
 import {
   DEFAULT_THRESHOLDS,
@@ -11,15 +14,28 @@ import {
 import type { ConcisionScores, ConcisionThresholds, ThresholdHit } from "./concise.js";
 
 const PACKAGE_NAME = "pi-jev-concise";
+const HIDDEN_ENTRY = `${PACKAGE_NAME}:hidden`;
+const APPROVED_ENTRY = `${PACKAGE_NAME}:approved`;
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_MAX_REQUESTS = 1_000;
 
 interface RuntimeConfig {
   enabled: boolean;
   logs: boolean;
+  buffered: boolean;
   thresholds: ConcisionThresholds;
   maxRetries: number;
   maxRequests: number;
+}
+
+interface HiddenMarkerData {
+  hashes: string[];
+}
+
+interface ApprovedAnswerData {
+  text: string;
+  outcome: "passed" | "fail-open" | "retry-limit";
+  timestamp: number;
 }
 
 function envNumber(name: string): number | undefined {
@@ -45,6 +61,7 @@ export function loadConfig(): RuntimeConfig {
   return {
     enabled: envBoolean("PI_JEV_CONCISE_ENABLED", true),
     logs: envBoolean("PI_JEV_CONCISE_LOGS", true),
+    buffered: envBoolean("PI_JEV_CONCISE_BUFFERED", true),
     thresholds: {
       needsRevision: normalizeThreshold(
         envNumber("PI_JEV_CONCISE_THRESHOLD"),
@@ -68,17 +85,53 @@ export function loadConfig(): RuntimeConfig {
   };
 }
 
+export function contentTextParts(content: unknown): string[] {
+  if (typeof content === "string") {
+    const text = content.trim();
+    return text ? [text] : [];
+  }
+  if (!Array.isArray(content)) return [];
+  return content.flatMap(part => {
+    if (!part || typeof part !== "object") return [];
+    const candidate = part as { type?: unknown; text?: unknown };
+    if (candidate.type !== "text" || typeof candidate.text !== "string") return [];
+    const text = candidate.text.trim();
+    return text ? [text] : [];
+  });
+}
+
 function contentText(content: unknown): string {
-  if (typeof content === "string") return content.trim();
-  if (!Array.isArray(content)) return "";
-  return content
-    .flatMap(part => {
-      if (!part || typeof part !== "object") return [];
-      const candidate = part as { type?: unknown; text?: unknown };
-      return candidate.type === "text" && typeof candidate.text === "string" ? [candidate.text] : [];
-    })
-    .join("\n")
-    .trim();
+  return contentTextParts(content).join("\n").trim();
+}
+
+export function markdownHash(markdown: string): string {
+  return createHash("sha256").update(markdown.trim(), "utf8").digest("hex");
+}
+
+export function hiddenHashesFromEntries(entries: readonly unknown[]): Set<string> {
+  const hashes = new Set<string>();
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object") continue;
+    const candidate = entry as { type?: unknown; customType?: unknown; data?: unknown };
+    if (candidate.type !== "custom" || candidate.customType !== HIDDEN_ENTRY) continue;
+    if (!candidate.data || typeof candidate.data !== "object") continue;
+    const marker = candidate.data as { hashes?: unknown };
+    if (!Array.isArray(marker.hashes)) continue;
+    for (const hash of marker.hashes) {
+      if (typeof hash === "string" && hash) hashes.add(hash);
+    }
+  }
+  return hashes;
+}
+
+export function shouldHideAssistantMarkdown(
+  markdown: string,
+  context: Pick<MarkdownTransformContext, "messageType" | "isStreaming">,
+  options: { enabled: boolean; buffered: boolean; hiddenHashes: ReadonlySet<string> },
+): boolean {
+  if (!options.buffered || context.messageType !== "assistant") return false;
+  if (options.hiddenHashes.has(markdownHash(markdown))) return true;
+  return options.enabled && context.isStreaming;
 }
 
 export function latestRoleMessage(messages: readonly unknown[], role: "user" | "assistant"): { text: string; index: number } | undefined {
@@ -145,12 +198,60 @@ export default function conciseExtension(pi: ExtensionAPI): void {
   let revising = false;
   let warned = false;
   let activeUserIndex: number | undefined;
+  let hiddenHashes = new Set<string>();
+
+  const publishApproved = (text: string, outcome: ApprovedAnswerData["outcome"]) => {
+    if (!config.buffered || !text.trim()) return;
+    pi.appendEntry<ApprovedAnswerData>(APPROVED_ENTRY, {
+      text: text.trim(),
+      outcome,
+      timestamp: Date.now(),
+    });
+  };
+
+  const markAssistantHidden = (content: unknown) => {
+    if (!config.buffered) return;
+    const newHashes: string[] = [];
+    for (const text of contentTextParts(content)) {
+      const hash = markdownHash(text);
+      if (hiddenHashes.has(hash)) continue;
+      hiddenHashes.add(hash);
+      newHashes.push(hash);
+    }
+    if (newHashes.length) {
+      pi.appendEntry<HiddenMarkerData>(HIDDEN_ENTRY, { hashes: newHashes });
+    }
+  };
 
   let judge: ReturnType<typeof createTypeSafe> | undefined;
   const getJudge = () => {
     if (!judge) judge = createTypeSafe({ maxRequests: config.maxRequests });
     return judge;
   };
+
+  pi.registerEntryRenderer<ApprovedAnswerData>(APPROVED_ENTRY, (entry) => {
+    const text = entry.data?.text?.trim();
+    if (!text) return undefined;
+    return new Markdown(text, 1, 0, getMarkdownTheme());
+  });
+
+  pi.registerMarkdownTransformer((markdown, context) => {
+    return shouldHideAssistantMarkdown(markdown, context, {
+      enabled,
+      buffered: config.buffered,
+      hiddenHashes,
+    }) ? "" : markdown;
+  });
+
+  pi.on("session_start", (_event, ctx) => {
+    if (!config.buffered) return;
+    hiddenHashes = hiddenHashesFromEntries(ctx.sessionManager.getBranch());
+  });
+
+  pi.on("message_end", (event) => {
+    if (!enabled || !config.buffered || event.message.role !== "assistant") return;
+    markAssistantHidden(event.message.content);
+  });
 
   pi.registerCommand("concise", {
     description: "Control the Jev concision gate: /concise [status|on|off]",
@@ -165,7 +266,7 @@ export default function conciseExtension(pi: ExtensionAPI): void {
 
       if (ctx.hasUI) {
         ctx.ui.notify(
-          `${PACKAGE_NAME}: ${enabled ? "on" : "off"}; thresholds: ${thresholdSummary(config.thresholds)}; max retries ${config.maxRetries}; logs ${config.logs ? "on" : "off"}.`,
+          `${PACKAGE_NAME}: ${enabled ? "on" : "off"}; buffered ${config.buffered ? "on" : "off"}; thresholds: ${thresholdSummary(config.thresholds)}; max retries ${config.maxRetries}; logs ${config.logs ? "on" : "off"}.`,
           "info",
         );
       }
@@ -180,7 +281,12 @@ export default function conciseExtension(pi: ExtensionAPI): void {
     if (!user || !assistant) {
       revising = false;
       retries = 0;
+      if (ctx.hasUI) ctx.ui.setStatus(PACKAGE_NAME, undefined);
       return;
+    }
+
+    if (ctx.hasUI && config.buffered) {
+      ctx.ui.setStatus(PACKAGE_NAME, "concise: checking…");
     }
 
     if (activeUserIndex !== user.index) {
@@ -196,11 +302,13 @@ export default function conciseExtension(pi: ExtensionAPI): void {
         thresholds: config.thresholds,
       });
     } catch (error) {
+      publishApproved(assistant.text, "fail-open");
       revising = false;
+      if (ctx.hasUI) ctx.ui.setStatus(PACKAGE_NAME, undefined);
       if (!warned && ctx.hasUI) {
         warned = true;
         ctx.ui.notify(
-          `${PACKAGE_NAME}: Jev unavailable (${error instanceof Error ? error.message : "unknown error"}). Responses will pass through unchanged.`,
+          `${PACKAGE_NAME}: Jev unavailable (${error instanceof Error ? error.message : "unknown error"}). Showing the answer unchanged.`,
           "warning",
         );
       }
@@ -208,33 +316,45 @@ export default function conciseExtension(pi: ExtensionAPI): void {
     }
 
     if (!verdict.ok) {
+      publishApproved(assistant.text, "fail-open");
       revising = false;
+      if (ctx.hasUI) ctx.ui.setStatus(PACKAGE_NAME, undefined);
       if (!warned && ctx.hasUI) {
         warned = true;
-        ctx.ui.notify(`${PACKAGE_NAME}: Jev check failed (${verdict.error}). Responses will pass through unchanged.`, "warning");
+        ctx.ui.notify(`${PACKAGE_NAME}: Jev check failed (${verdict.error}). Showing the answer unchanged.`, "warning");
       }
       return;
     }
 
     warned = false;
     if (verdict.pass) {
+      publishApproved(assistant.text, "passed");
       if (revising && config.logs && ctx.hasUI) {
         ctx.ui.notify(passLog(verdict.scores, config.thresholds, verdict.elapsedMs), "info");
       }
       revising = false;
       retries = 0;
+      if (ctx.hasUI) ctx.ui.setStatus(PACKAGE_NAME, undefined);
       return;
     }
 
     if (retries >= config.maxRetries) {
+      publishApproved(assistant.text, "retry-limit");
       revising = false;
       retries = 0;
-      if (ctx.hasUI) ctx.ui.notify(`${PACKAGE_NAME}: retry limit reached; keeping the latest answer.`, "warning");
+      if (ctx.hasUI) {
+        ctx.ui.setStatus(PACKAGE_NAME, undefined);
+        ctx.ui.notify(`${PACKAGE_NAME}: retry limit reached; showing the latest answer.`, "warning");
+      }
       return;
     }
 
     retries += 1;
     revising = true;
+
+    if (ctx.hasUI && config.buffered) {
+      ctx.ui.setStatus(PACKAGE_NAME, `concise: retry ${retries}/${config.maxRetries}`);
+    }
 
     if (config.logs && ctx.hasUI) {
       ctx.ui.notify(
