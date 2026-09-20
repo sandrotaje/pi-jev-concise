@@ -1,11 +1,14 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createTypeSafe } from "pi-typesafe";
 import {
+  DEFAULT_THRESHOLDS,
   evaluateConcision,
   formatScore,
   normalizeThreshold,
   revisionFeedback,
+  signalLabel,
 } from "./concise.js";
+import type { ConcisionScores, ConcisionThresholds, ThresholdHit } from "./concise.js";
 
 const PACKAGE_NAME = "pi-jev-concise";
 const DEFAULT_MAX_RETRIES = 3;
@@ -14,7 +17,7 @@ const DEFAULT_MAX_REQUESTS = 1_000;
 interface RuntimeConfig {
   enabled: boolean;
   logs: boolean;
-  threshold: number;
+  thresholds: ConcisionThresholds;
   maxRetries: number;
   maxRequests: number;
 }
@@ -42,7 +45,24 @@ export function loadConfig(): RuntimeConfig {
   return {
     enabled: envBoolean("PI_JEV_CONCISE_ENABLED", true),
     logs: envBoolean("PI_JEV_CONCISE_LOGS", true),
-    threshold: normalizeThreshold(envNumber("PI_JEV_CONCISE_THRESHOLD")),
+    thresholds: {
+      needsRevision: normalizeThreshold(
+        envNumber("PI_JEV_CONCISE_THRESHOLD"),
+        DEFAULT_THRESHOLDS.needsRevision,
+      ),
+      repetition: normalizeThreshold(
+        envNumber("PI_JEV_CONCISE_REPETITION_THRESHOLD"),
+        DEFAULT_THRESHOLDS.repetition,
+      ),
+      filler: normalizeThreshold(
+        envNumber("PI_JEV_CONCISE_FILLER_THRESHOLD"),
+        DEFAULT_THRESHOLDS.filler,
+      ),
+      overExplanation: normalizeThreshold(
+        envNumber("PI_JEV_CONCISE_OVER_EXPLANATION_THRESHOLD"),
+        DEFAULT_THRESHOLDS.overExplanation,
+      ),
+    },
     maxRetries: positiveInteger(envNumber("PI_JEV_CONCISE_MAX_RETRIES"), DEFAULT_MAX_RETRIES),
     maxRequests: positiveInteger(envNumber("PI_JEV_CONCISE_MAX_REQUESTS"), DEFAULT_MAX_REQUESTS),
   };
@@ -77,25 +97,45 @@ export function latestRoleText(messages: readonly unknown[], role: "user" | "ass
   return latestRoleMessage(messages, role)?.text;
 }
 
+function formatHit(hit: ThresholdHit): string {
+  return `${signalLabel(hit.signal)} ${formatScore(hit.score)} >= ${formatScore(hit.threshold)}`;
+}
+
 export function interventionLog(
-  scores: { needsRevision: number; repetition: number; filler: number; overExplanation: number },
+  hits: readonly ThresholdHit[],
+  scores: ConcisionScores,
   retry: number,
   maxRetries: number,
-  threshold: number,
+  elapsedMs: number,
+): string {
+  const reasons = hits.length
+    ? hits.map(formatHit).join(", ")
+    : `revise ${formatScore(scores.needsRevision)}`;
+  return `${PACKAGE_NAME}: intervention ${retry}/${maxRetries} · FAIL ${reasons} · ${elapsedMs} ms`;
+}
+
+export function passLog(
+  scores: ConcisionScores,
+  thresholds: ConcisionThresholds,
   elapsedMs: number,
 ): string {
   return [
-    `${PACKAGE_NAME}: intervention ${retry}/${maxRetries}`,
-    `revise ${formatScore(scores.needsRevision)} >= ${formatScore(threshold)}`,
-    `repetition ${formatScore(scores.repetition)}`,
-    `filler ${formatScore(scores.filler)}`,
-    `over-explanation ${formatScore(scores.overExplanation)}`,
+    `${PACKAGE_NAME}: revision passed`,
+    `revise ${formatScore(scores.needsRevision)} < ${formatScore(thresholds.needsRevision)}`,
+    `repetition ${formatScore(scores.repetition)} < ${formatScore(thresholds.repetition)}`,
+    `filler ${formatScore(scores.filler)} < ${formatScore(thresholds.filler)}`,
+    `over-explanation ${formatScore(scores.overExplanation)} < ${formatScore(thresholds.overExplanation)}`,
     `${elapsedMs} ms`,
   ].join(" · ");
 }
 
-export function passLog(needsRevision: number, threshold: number, elapsedMs: number): string {
-  return `${PACKAGE_NAME}: revision passed · revise ${formatScore(needsRevision)} < ${formatScore(threshold)} · ${elapsedMs} ms`;
+function thresholdSummary(thresholds: ConcisionThresholds): string {
+  return [
+    `revise ${formatScore(thresholds.needsRevision)}`,
+    `repetition ${formatScore(thresholds.repetition)}`,
+    `filler ${formatScore(thresholds.filler)}`,
+    `over-explanation ${formatScore(thresholds.overExplanation)}`,
+  ].join(", ");
 }
 
 export default function conciseExtension(pi: ExtensionAPI): void {
@@ -125,7 +165,7 @@ export default function conciseExtension(pi: ExtensionAPI): void {
 
       if (ctx.hasUI) {
         ctx.ui.notify(
-          `${PACKAGE_NAME}: ${enabled ? "on" : "off"}; threshold ${config.threshold.toFixed(2)}; max retries ${config.maxRetries}; logs ${config.logs ? "on" : "off"}.`,
+          `${PACKAGE_NAME}: ${enabled ? "on" : "off"}; thresholds: ${thresholdSummary(config.thresholds)}; max retries ${config.maxRetries}; logs ${config.logs ? "on" : "off"}.`,
           "info",
         );
       }
@@ -153,7 +193,7 @@ export default function conciseExtension(pi: ExtensionAPI): void {
     let verdict;
     try {
       verdict = await evaluateConcision(getJudge(), user.text, assistant.text, {
-        threshold: config.threshold,
+        thresholds: config.thresholds,
       });
     } catch (error) {
       revising = false;
@@ -179,7 +219,7 @@ export default function conciseExtension(pi: ExtensionAPI): void {
     warned = false;
     if (verdict.pass) {
       if (revising && config.logs && ctx.hasUI) {
-        ctx.ui.notify(passLog(verdict.scores.needsRevision, config.threshold, verdict.elapsedMs), "info");
+        ctx.ui.notify(passLog(verdict.scores, config.thresholds, verdict.elapsedMs), "info");
       }
       revising = false;
       retries = 0;
@@ -198,7 +238,7 @@ export default function conciseExtension(pi: ExtensionAPI): void {
 
     if (config.logs && ctx.hasUI) {
       ctx.ui.notify(
-        interventionLog(verdict.scores, retries, config.maxRetries, config.threshold, verdict.elapsedMs),
+        interventionLog(verdict.hits, verdict.scores, retries, config.maxRetries, verdict.elapsedMs),
         "warning",
       );
     }
@@ -206,7 +246,7 @@ export default function conciseExtension(pi: ExtensionAPI): void {
     pi.sendMessage(
       {
         customType: PACKAGE_NAME,
-        content: revisionFeedback(verdict.scores),
+        content: revisionFeedback(verdict.scores, config.thresholds),
         display: false,
       },
       {
