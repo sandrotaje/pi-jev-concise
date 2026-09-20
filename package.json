@@ -1,6 +1,6 @@
 {
   "name": "pi-jev-concise",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A Pi extension that uses Jev to detect unnecessarily verbose answers and automatically request a more concise revision.",
   "type": "module",
   "license": "MIT",
