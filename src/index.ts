@@ -21,4 +21,14 @@ export type {
   EvaluateConcisionOptions,
   ThresholdHit,
 } from "./concise.js";
-export { interventionLog, latestRoleMessage, latestRoleText, loadConfig, passLog } from "./extension.js";
+export {
+  contentTextParts,
+  hiddenHashesFromEntries,
+  interventionLog,
+  latestRoleMessage,
+  latestRoleText,
+  loadConfig,
+  markdownHash,
+  passLog,
+  shouldHideAssistantMarkdown,
+} from "./extension.js";
