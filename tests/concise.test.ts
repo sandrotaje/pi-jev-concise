@@ -9,7 +9,16 @@ import {
   revisionFeedback,
   thresholdHits,
 } from "../src/concise.js";
-import { interventionLog, latestRoleText, loadConfig, passLog } from "../src/extension.js";
+import {
+  contentTextParts,
+  hiddenHashesFromEntries,
+  interventionLog,
+  latestRoleText,
+  loadConfig,
+  markdownHash,
+  passLog,
+  shouldHideAssistantMarkdown,
+} from "../src/extension.js";
 
 function judgeWith(scores: { needsRevision: number; repetition: number; filler: number; overExplanation: number }): Judge {
   return {
@@ -94,6 +103,61 @@ test("pass log shows all four signals under threshold", () => {
   assert.match(text, /98 ms/);
 });
 
+test("extracts separate assistant text blocks for renderer hashing", () => {
+  assert.deepEqual(
+    contentTextParts([
+      { type: "text", text: " first " },
+      { type: "toolCall", name: "read" },
+      { type: "text", text: "second" },
+    ]),
+    ["first", "second"],
+  );
+});
+
+test("buffered mode hides assistant streaming output", () => {
+  assert.equal(
+    shouldHideAssistantMarkdown("draft", { messageType: "assistant", isStreaming: true }, {
+      enabled: true,
+      buffered: true,
+      hiddenHashes: new Set(),
+    }),
+    true,
+  );
+});
+
+test("recorded drafts stay hidden after the gate is disabled", () => {
+  const hiddenHashes = new Set([markdownHash("rejected draft")]);
+  assert.equal(
+    shouldHideAssistantMarkdown("rejected draft", { messageType: "assistant", isStreaming: false }, {
+      enabled: false,
+      buffered: true,
+      hiddenHashes,
+    }),
+    true,
+  );
+});
+
+test("user markdown is never hidden by the assistant buffer", () => {
+  assert.equal(
+    shouldHideAssistantMarkdown("hello", { messageType: "user", isStreaming: true }, {
+      enabled: true,
+      buffered: true,
+      hiddenHashes: new Set([markdownHash("hello")]),
+    }),
+    false,
+  );
+});
+
+test("hidden draft hashes restore from persisted custom entries", () => {
+  const one = markdownHash("one");
+  const two = markdownHash("two");
+  const hashes = hiddenHashesFromEntries([
+    { type: "custom", customType: "pi-jev-concise:hidden", data: { hashes: [one, two] } },
+    { type: "custom", customType: "other", data: { hashes: ["ignored"] } },
+  ]);
+  assert.deepEqual([...hashes], [one, two]);
+});
+
 test("extracts the latest textual message by role", () => {
   const messages = [
     { role: "user", content: [{ type: "text", text: "first" }] },
@@ -116,10 +180,11 @@ test("invalid thresholds fall back independently", () => {
   });
 });
 
-test("config defaults to aggressive multi-signal thresholds with logs on", () => {
+test("config defaults to buffered multi-signal mode with logs on", () => {
   const names = [
     "PI_JEV_CONCISE_ENABLED",
     "PI_JEV_CONCISE_LOGS",
+    "PI_JEV_CONCISE_BUFFERED",
     "PI_JEV_CONCISE_THRESHOLD",
     "PI_JEV_CONCISE_REPETITION_THRESHOLD",
     "PI_JEV_CONCISE_FILLER_THRESHOLD",
@@ -131,6 +196,7 @@ test("config defaults to aggressive multi-signal thresholds with logs on", () =>
     const config = loadConfig();
     assert.equal(config.enabled, true);
     assert.equal(config.logs, true);
+    assert.equal(config.buffered, true);
     assert.deepEqual(config.thresholds, DEFAULT_THRESHOLDS);
   } finally {
     for (const name of names) {
