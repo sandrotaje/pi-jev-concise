@@ -1,7 +1,6 @@
 import { ask, noul } from "pi-typesafe";
 import type { Judge } from "pi-typesafe";
 
-export const DEFAULT_THRESHOLD = 0.72;
 export const DEFAULT_TIMEOUT_MS = 8_000;
 
 export interface ConcisionScores {
@@ -11,10 +10,36 @@ export interface ConcisionScores {
   overExplanation: number;
 }
 
+export interface ConcisionThresholds {
+  needsRevision: number;
+  repetition: number;
+  filler: number;
+  overExplanation: number;
+}
+
+export const DEFAULT_THRESHOLDS: ConcisionThresholds = {
+  needsRevision: 0.60,
+  repetition: 0.65,
+  filler: 0.60,
+  overExplanation: 0.70,
+};
+
+/** Backward-compatible alias for the main compressibility threshold. */
+export const DEFAULT_THRESHOLD = DEFAULT_THRESHOLDS.needsRevision;
+
+export type ConcisionSignal = keyof ConcisionScores;
+
+export interface ThresholdHit {
+  signal: ConcisionSignal;
+  score: number;
+  threshold: number;
+}
+
 export interface ConcisionPass {
   ok: true;
   pass: boolean;
   scores: ConcisionScores;
+  hits: ThresholdHit[];
   model: string;
   elapsedMs: number;
 }
@@ -28,7 +53,9 @@ export interface ConcisionFailure {
 export type ConcisionVerdict = ConcisionPass | ConcisionFailure;
 
 export interface EvaluateConcisionOptions {
+  /** Backward-compatible shorthand for thresholds.needsRevision. */
   threshold?: number;
+  thresholds?: Partial<ConcisionThresholds>;
   timeoutMs?: number;
   signal?: AbortSignal;
 }
@@ -37,8 +64,35 @@ export function validProbability(value: number): boolean {
   return Number.isFinite(value) && value >= 0 && value <= 1;
 }
 
-export function normalizeThreshold(value: number | undefined): number {
-  return value !== undefined && validProbability(value) ? value : DEFAULT_THRESHOLD;
+export function normalizeThreshold(value: number | undefined, fallback = DEFAULT_THRESHOLD): number {
+  return value !== undefined && validProbability(value) ? value : fallback;
+}
+
+export function normalizeThresholds(
+  thresholds: Partial<ConcisionThresholds> = {},
+  mainThreshold?: number,
+): ConcisionThresholds {
+  return {
+    needsRevision: normalizeThreshold(
+      mainThreshold ?? thresholds.needsRevision,
+      DEFAULT_THRESHOLDS.needsRevision,
+    ),
+    repetition: normalizeThreshold(thresholds.repetition, DEFAULT_THRESHOLDS.repetition),
+    filler: normalizeThreshold(thresholds.filler, DEFAULT_THRESHOLDS.filler),
+    overExplanation: normalizeThreshold(thresholds.overExplanation, DEFAULT_THRESHOLDS.overExplanation),
+  };
+}
+
+export function thresholdHits(
+  scores: ConcisionScores,
+  thresholds: ConcisionThresholds,
+): ThresholdHit[] {
+  const signals: ConcisionSignal[] = ["needsRevision", "repetition", "filler", "overExplanation"];
+  return signals.flatMap(signal =>
+    scores[signal] >= thresholds[signal]
+      ? [{ signal, score: scores[signal], threshold: thresholds[signal] }]
+      : [],
+  );
 }
 
 export async function evaluateConcision(
@@ -47,7 +101,7 @@ export async function evaluateConcision(
   response: string,
   options: EvaluateConcisionOptions = {},
 ): Promise<ConcisionVerdict> {
-  const threshold = normalizeThreshold(options.threshold);
+  const thresholds = normalizeThresholds(options.thresholds, options.threshold);
   const result = await ask(judge, {
     state: {
       user_request: request,
@@ -86,11 +140,13 @@ export async function evaluateConcision(
     filler: result.answers.filler.noul,
     overExplanation: result.answers.overExplanation.noul,
   };
+  const hits = thresholdHits(scores, thresholds);
 
   return {
     ok: true,
-    pass: scores.needsRevision < threshold,
+    pass: hits.length === 0,
     scores,
+    hits,
     model: result.model,
     elapsedMs: result.elapsedMs,
   };
@@ -100,17 +156,27 @@ export function formatScore(value: number): string {
   return value.toFixed(2);
 }
 
-export function revisionFeedback(scores: ConcisionScores): string {
-  const issues: string[] = [];
-  if (scores.repetition >= 0.5) issues.push(`repetition ${formatScore(scores.repetition)}`);
-  if (scores.filler >= 0.5) issues.push(`filler ${formatScore(scores.filler)}`);
-  if (scores.overExplanation >= 0.5) issues.push(`over-explanation ${formatScore(scores.overExplanation)}`);
-  if (!issues.length) issues.push(`compressibility ${formatScore(scores.needsRevision)}`);
+export function signalLabel(signal: ConcisionSignal): string {
+  switch (signal) {
+    case "needsRevision": return "revise";
+    case "repetition": return "repetition";
+    case "filler": return "filler";
+    case "overExplanation": return "over-explanation";
+  }
+}
+
+export function revisionFeedback(
+  scores: ConcisionScores,
+  thresholds: ConcisionThresholds = DEFAULT_THRESHOLDS,
+): string {
+  const hits = thresholdHits(scores, thresholds);
+  const issues = hits.length
+    ? hits.map(hit => `${signalLabel(hit.signal)} ${formatScore(hit.score)} >= ${formatScore(hit.threshold)}`)
+    : [`compressibility ${formatScore(scores.needsRevision)}`];
 
   return [
     "pi-jev-concise: revise your immediately previous answer.",
-    `Jev judged that it can be materially shorter without reducing its usefulness (P=${formatScore(scores.needsRevision)}).`,
-    `Signals: ${issues.join(", ")}.`,
+    `Jev found one or more concision signals above the configured threshold: ${issues.join(", ")}.`,
     "Rewrite the previous answer only. Preserve all information needed to satisfy the user's request, including necessary precision, caveats, and actionable details, but remove repetition, filler, unnecessary framing, and over-explanation.",
     "Do not redo the underlying task, do not call tools unless the previous answer cannot be revised without them, and do not mention this quality check. Return only the revised answer.",
   ].join("\n");
